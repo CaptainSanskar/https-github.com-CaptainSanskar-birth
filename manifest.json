@@ -1,0 +1,23 @@
+
+{
+  "name": "Happy4U",
+  "short_name": "Happy4U",
+  "start_url": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#000000",
+  "theme_color": "#D2F801",
+  "description": "Premium Birthday Tracker with Neon Aesthetic",
+  "icons": [
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/4213/4213652.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/4213/4213652.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
