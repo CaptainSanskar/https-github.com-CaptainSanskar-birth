@@ -9,7 +9,8 @@ import { WelcomeModal } from './components/WelcomeModal';
 import { NotesView } from './components/NotesView';
 import { NotificationPermissionModal } from './components/NotificationPermissionModal';
 import { syncToIndexedDB, registerServiceWorker, syncSettingToIndexedDB } from './utils/storage';
-import { Plus, Calendar as CalendarIcon, Home, Settings, Bell, Gift, Sparkles, Zap, Edit2, Camera, Moon, Sun, StickyNote, Palette, Check, Trash2, Clock } from 'lucide-react';
+import { getFCMToken, isFirebaseConfigured, registerOnMessageListener } from './utils/firebase';
+import { Plus, Calendar as CalendarIcon, Home, Settings, Bell, Gift, Sparkles, Zap, Edit2, Camera, Moon, Sun, StickyNote, Palette, Check, Trash2, Clock, ShieldCheck, Copy, Terminal, ExternalLink } from 'lucide-react';
 
 const STORAGE_KEY = 'happy4u_birthdays';
 const USER_KEY = 'happy4u_username';
@@ -90,6 +91,26 @@ export default function App() {
   });
   const [notificationsEnabled, setNotificationsEnabled] = useState(false);
   const [celebrations, setCelebrations] = useState<CelebrationHistory[]>([]);
+
+  // Appilix / FCM Push States
+  const [fcmToken, setFcmToken] = useState<string | null>(null);
+  const [fcmLoading, setFcmLoading] = useState<boolean>(false);
+  const [fcmError, setTransientFCMError] = useState<string | null>(null);
+  const [fcmConfigured, setFcmConfigured] = useState<boolean>(false);
+
+  // Check on load if Firebase config is ready
+  useEffect(() => {
+     setFcmConfigured(isFirebaseConfigured());
+  }, []);
+
+  // Set up foreground FCM listener if active
+  useEffect(() => {
+     if (isFirebaseConfigured()) {
+         registerOnMessageListener((payload) => {
+             alert(`Push notification received in foreground! \n\nTitle: ${payload.notification?.title || payload.data?.title || 'FCM Push'}\nBody: ${payload.notification?.body || payload.data?.body || ''}`);
+         });
+     }
+  }, []);
 
   // Load data
   useEffect(() => {
@@ -616,6 +637,83 @@ export default function App() {
                          </div>
                     </div>
                     
+                    <div className="bg-dark-card border border-dark-border rounded-3xl p-6 animate-scale-in" style={{ animationDelay: '150ms', animationFillMode: 'backwards' }}>
+                         <div className="flex items-center gap-2 mb-4">
+                            <Terminal size={18} className="text-lime" />
+                            <h3 className="text-primary font-bold">Appilix FCM Diagnostics</h3>
+                         </div>
+                         
+                         <p className="text-xs text-muted leading-relaxed mb-4">
+                            Appilix WebView apps rely on <b>Firebase Cloud Messaging (FCM)</b> to deliver native push alerts. Use this panel to register and copy your device registration token.
+                         </p>
+
+                         {!fcmConfigured ? (
+                             <div className="bg-amber-500/10 border border-amber-500/20 rounded-2xl p-4 text-xs text-amber-300 leading-relaxed mb-4 flex flex-col gap-1">
+                                 <p className="font-bold">Configuration Needed ⚠️</p>
+                                 <p className="opacity-90">
+                                     Your web environment does not have FCM configuration variables initialized. Add your Keys with the VITE_ prefix inside your `.env` file to activate.
+                                 </p>
+                             </div>
+                         ) : (
+                             <div className="space-y-4">
+                                 {fcmToken ? (
+                                     <div className="space-y-2">
+                                         <p className="text-xs text-lime font-bold">✓ FCM Active & Registered!</p>
+                                         <div className="bg-surfaceLight border border-dark-border rounded-2xl p-3 flex flex-col gap-2 relative">
+                                             <span className="text-[10px] text-muted font-mono uppercase tracking-wider">Device Push Token:</span>
+                                             <textarea 
+                                                 readOnly 
+                                                 value={fcmToken} 
+                                                 className="w-full bg-transparent text-xs text-muted font-mono border-0 focus:outline-none focus:ring-0 resize-none h-16 leading-relaxed select-all"
+                                             />
+                                             <button
+                                                 onClick={() => {
+                                                     navigator.clipboard.writeText(fcmToken || "");
+                                                     alert("Token copied to clipboard!");
+                                                 }}
+                                                 className="self-end bg-lime/10 hover:bg-lime/20 text-lime font-bold py-1.5 px-3 rounded-xl text-xs flex items-center gap-1.5 transition-colors cursor-pointer"
+                                             >
+                                                 <Copy size={12} />
+                                                 Copy Token
+                                             </button>
+                                         </div>
+                                         <p className="text-[11px] text-muted leading-relaxed">
+                                             Use the <b>Firebase Console</b> to send a push message targeting this token to verify notifications deliver correctly to this device!
+                                         </p>
+                                     </div>
+                                 ) : (
+                                     <button 
+                                         onClick={async () => {
+                                             setFcmLoading(true);
+                                             setTransientFCMError(null);
+                                             try {
+                                                 const token = await getFCMToken();
+                                                 if (token) {
+                                                     setFcmToken(token);
+                                                  } else {
+                                                     setTransientFCMError("Could not retrieve token. Ensure user allowed notifications.");
+                                                  }
+                                             } catch (err: any) {
+                                                 setTransientFCMError(err.message || "Failed to initialize FCM token retrieval.");
+                                             } finally {
+                                                 setFcmLoading(false);
+                                             }
+                                         }}
+                                         disabled={fcmLoading}
+                                         className="w-full bg-lime hover:bg-lime-dim text-black font-bold py-3.5 rounded-2xl flex items-center justify-center gap-2 shadow-lg shadow-lime/10 transition-all active:scale-95 text-sm cursor-pointer disabled:opacity-55"
+                                     >
+                                         <ShieldCheck size={18} />
+                                         {fcmLoading ? 'Fetching FCM Token...' : 'Register FCM Push Token'}
+                                     </button>
+                                 )}
+                                 
+                                 {fcmError && (
+                                     <p className="text-xs text-red-400 mt-2 font-medium">⚠️ {fcmError}</p>
+                                 )}
+                             </div>
+                         )}
+                    </div>
+
                     <div className="bg-dark-card border border-dark-border rounded-3xl p-6 animate-scale-in" style={{ animationDelay: '200ms', animationFillMode: 'backwards' }}>
                          <h3 className="text-primary font-bold mb-4">Data</h3>
                          <button 

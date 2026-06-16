@@ -8,6 +8,7 @@
   "background_color": "#000000",
   "theme_color": "#D2F801",
   "description": "Premium Birthday Tracker with Neon Aesthetic",
+  "gcm_sender_id": "103953800507",
   "icons": [
     {
       "src": "https://cdn-icons-png.flaticon.com/512/4213/4213652.png",

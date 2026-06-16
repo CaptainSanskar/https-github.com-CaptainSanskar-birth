@@ -27,7 +27,9 @@ export const registerServiceWorker = () => {
                         // @ts-ignore
                         registration.periodicSync.register('check-birthdays', {
                             minInterval: 24 * 60 * 60 * 1000 // 24 hours
-                        }).then(() => console.log('Periodic sync registered'));
+                        })
+                        .then(() => console.log('Periodic sync registered'))
+                        .catch(err => console.log('Periodic sync registration rejected (optional feature)', err));
                     } catch (e) {
                         console.log('Periodic sync failed (optional feature)', e);
                     }
@@ -37,7 +39,9 @@ export const registerServiceWorker = () => {
                 if ('sync' in registration) {
                     try {
                         // @ts-ignore
-                        registration.sync.register('check-birthdays');
+                        registration.sync.register('check-birthdays')
+                        .then(() => console.log('Background sync registered'))
+                        .catch(err => console.log('Background sync registration rejected (optional feature)', err));
                     } catch (e) {
                         console.log('Background sync failed (optional feature)', e);
                     }
