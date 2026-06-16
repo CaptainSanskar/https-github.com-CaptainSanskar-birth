@@ -1,8 +1,7 @@
-
 import { Birthday } from '../types';
 
 export const DB_NAME = 'BirthdayDB';
-export const DB_VERSION = 1;
+export const DB_VERSION = 2;
 
 export const registerServiceWorker = () => {
     if ('serviceWorker' in navigator) {
@@ -43,6 +42,11 @@ export const registerServiceWorker = () => {
                         console.log('Background sync failed (optional feature)', e);
                     }
                 }
+
+                // Initial notification scheduling request
+                if (registration.active) {
+                    registration.active.postMessage({ action: 'rescheduleNotifications' });
+                }
             })
             .catch(error => {
                 // Graceful handling for Preview/Sandbox environments
@@ -60,7 +64,6 @@ export const registerServiceWorker = () => {
 };
 
 export const syncToIndexedDB = (birthdays: Birthday[]) => {
-    // Safety check for SSR/Non-browser environments
     if (typeof window === 'undefined' || !window.indexedDB) return;
 
     const request = indexedDB.open(DB_NAME, DB_VERSION);
@@ -73,6 +76,12 @@ export const syncToIndexedDB = (birthdays: Birthday[]) => {
         const db = event.target.result;
         if (!db.objectStoreNames.contains('birthdays')) {
             db.createObjectStore('birthdays', { keyPath: 'id' });
+        }
+        if (!db.objectStoreNames.contains('settings')) {
+            db.createObjectStore('settings', { keyPath: 'key' });
+        }
+        if (!db.objectStoreNames.contains('notifications_history')) {
+            db.createObjectStore('notifications_history', { keyPath: 'id' });
         }
     };
 
@@ -90,10 +99,47 @@ export const syncToIndexedDB = (birthdays: Birthday[]) => {
         };
         
         transaction.oncomplete = () => {
-            // Trigger SW update if available
             if (navigator.serviceWorker.controller) {
                 navigator.serviceWorker.controller.postMessage({
-                    action: 'checkBirthdays'
+                    action: 'rescheduleNotifications'
+                });
+            }
+        };
+    };
+};
+
+export const syncSettingToIndexedDB = (key: string, value: any) => {
+    if (typeof window === 'undefined' || !window.indexedDB) return;
+
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+    
+    request.onerror = (event: any) => {
+        console.error('IndexedDB settings error:', event.target.error);
+    };
+
+    request.onupgradeneeded = (event: any) => {
+        const db = event.target.result;
+        if (!db.objectStoreNames.contains('birthdays')) {
+            db.createObjectStore('birthdays', { keyPath: 'id' });
+        }
+        if (!db.objectStoreNames.contains('settings')) {
+            db.createObjectStore('settings', { keyPath: 'key' });
+        }
+        if (!db.objectStoreNames.contains('notifications_history')) {
+            db.createObjectStore('notifications_history', { keyPath: 'id' });
+        }
+    };
+    
+    request.onsuccess = (event: any) => {
+        const db = event.target.result;
+        const transaction = db.transaction(['settings'], 'readwrite');
+        const store = transaction.objectStore('settings');
+        store.put({ key, value });
+        
+        transaction.oncomplete = () => {
+            if (navigator.serviceWorker.controller) {
+                navigator.serviceWorker.controller.postMessage({
+                    action: 'rescheduleNotifications'
                 });
             }
         };

@@ -1,6 +1,6 @@
 
 import React, { useState, useEffect, useMemo } from 'react';
-import { Birthday } from './types';
+import { Birthday, CelebrationHistory } from './types';
 import { calculateDaysUntil, sortBirthdays, calculateNextAge, isToday, formatDateFriendly } from './utils/dateUtils';
 import { AddBirthdayModal } from './components/AddBirthdayModal';
 import { BirthdayPopup } from './components/BirthdayPopup';
@@ -8,7 +8,7 @@ import { CalendarView } from './components/CalendarView';
 import { WelcomeModal } from './components/WelcomeModal';
 import { NotesView } from './components/NotesView';
 import { NotificationPermissionModal } from './components/NotificationPermissionModal';
-import { syncToIndexedDB, registerServiceWorker } from './utils/storage';
+import { syncToIndexedDB, registerServiceWorker, syncSettingToIndexedDB } from './utils/storage';
 import { Plus, Calendar as CalendarIcon, Home, Settings, Bell, Gift, Sparkles, Zap, Edit2, Camera, Moon, Sun, StickyNote, Palette, Check, Trash2, Clock } from 'lucide-react';
 
 const STORAGE_KEY = 'happy4u_birthdays';
@@ -17,6 +17,9 @@ const GENDER_KEY = 'happy4u_gender';
 const THEME_KEY = 'happy4u_theme';
 const ACCENT_KEY = 'happy4u_accent';
 const NOTIF_TIME_KEY = 'happy4u_notif_time';
+const CELEBRATIONS_KEY = 'happy4u_celebrations';
+const NOTIF_MUTED_KEY = 'happy4u_notifications_muted';
+const POPUPS_SHOWN_KEY = 'happy4u_shown_popups';
 
 // Color Themes Configuration
 const THEMES = [
@@ -70,8 +73,23 @@ export default function App() {
   
   const [editingId, setEditingId] = useState<string | null>(null);
   const [popupBirthdays, setPopupBirthdays] = useState<Birthday[]>([]);
-  const [shownPopups, setShownPopups] = useState<Set<string>>(new Set());
+  const [shownPopups, setShownPopups] = useState<Set<string>>(() => {
+    const saved = localStorage.getItem(POPUPS_SHOWN_KEY);
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+        const todayStr = new Date().toDateString();
+        if (parsed.date === todayStr && Array.isArray(parsed.ids)) {
+          return new Set(parsed.ids);
+        }
+      } catch (e) {
+        console.error("Failed to parse shown popups", e);
+      }
+    }
+    return new Set();
+  });
   const [notificationsEnabled, setNotificationsEnabled] = useState(false);
+  const [celebrations, setCelebrations] = useState<CelebrationHistory[]>([]);
 
   // Load data
   useEffect(() => {
@@ -85,6 +103,7 @@ export default function App() {
     const savedTheme = localStorage.getItem(THEME_KEY);
     const savedAccent = localStorage.getItem(ACCENT_KEY);
     const savedNotifTime = localStorage.getItem(NOTIF_TIME_KEY);
+    const savedCelebrations = localStorage.getItem(CELEBRATIONS_KEY);
 
     if (savedBirthdays) {
       try {
@@ -100,8 +119,14 @@ export default function App() {
     if (savedUser) {
         setUsername(savedUser);
     } else {
-        // If no user, show welcome modal after a short delay
-        setTimeout(() => setIsWelcomeOpen(true), 500);
+        // First-time user onboarding sequence!
+        // Show the notification permission request as the absolute first screen if default
+        if ('Notification' in window && Notification.permission === 'default') {
+            setIsNotificationModalOpen(true);
+        } else {
+            // Already handled or not supported, go straight to welcome profile creation
+            setIsWelcomeOpen(true);
+        }
     }
 
     if (savedGender) {
@@ -120,15 +145,26 @@ export default function App() {
     if (savedNotifTime) {
         setNotificationTime(savedNotifTime);
     }
+
+    if (savedCelebrations) {
+      try {
+        setCelebrations(JSON.parse(savedCelebrations));
+      } catch (e) {
+        console.error("Failed to parse celebrations", e);
+      }
+    }
     
-    // Check initial notification status
+    // Check initial notification status (only auto-prompts on timer for returned active users)
+    const savedNotifMuted = localStorage.getItem(NOTIF_MUTED_KEY) === 'true';
     if ('Notification' in window) {
-        if (Notification.permission === 'granted') {
+        if (Notification.permission === 'granted' && !savedNotifMuted) {
             setNotificationsEnabled(true);
-        } else if (Notification.permission === 'default') {
+        } else if (Notification.permission === 'default' && !savedNotifMuted) {
             setTimeout(() => {
                 if (savedUser) setIsNotificationModalOpen(true);
             }, 3000);
+        } else {
+            setNotificationsEnabled(false);
         }
     }
   }, []);
@@ -161,14 +197,53 @@ export default function App() {
 
   useEffect(() => {
       localStorage.setItem(NOTIF_TIME_KEY, notificationTime);
+      syncSettingToIndexedDB('notificationTime', notificationTime);
   }, [notificationTime]);
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(birthdays));
-    if (birthdays.length > 0) {
-        syncToIndexedDB(birthdays);
+      syncSettingToIndexedDB('notificationsEnabled', notificationsEnabled);
+  }, [notificationsEnabled]);
+
+  useEffect(() => {
+    if (birthdays.length === 0) return;
+
+    const params = new URLSearchParams(window.location.search);
+    const viewParam = params.get('view');
+    const bdayIdParam = params.get('birthdayId');
+
+    if (viewParam && ['home', 'list', 'notes', 'settings'].includes(viewParam)) {
+        setView(viewParam as any);
+    }
+
+    if (bdayIdParam) {
+        const matched = birthdays.find(b => b.id === bdayIdParam);
+        if (matched) {
+            setPopupBirthdays([matched]);
+        }
+    }
+
+    // Clean up url to maintain clean state after deep link was consumed
+    if (viewParam || bdayIdParam) {
+        window.history.replaceState({}, document.title, window.location.pathname);
     }
   }, [birthdays]);
+
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(birthdays));
+    syncToIndexedDB(birthdays);
+  }, [birthdays]);
+
+  useEffect(() => {
+    localStorage.setItem(CELEBRATIONS_KEY, JSON.stringify(celebrations));
+  }, [celebrations]);
+
+  useEffect(() => {
+    const todayStr = new Date().toDateString();
+    localStorage.setItem(POPUPS_SHOWN_KEY, JSON.stringify({
+      date: todayStr,
+      ids: Array.from(shownPopups)
+    }));
+  }, [shownPopups]);
 
   const handleSaveProfile = (name: string, newGender: 'male' | 'female') => {
       setUsername(name);
@@ -206,6 +281,24 @@ export default function App() {
     setIsModalOpen(false);
   };
 
+  const handleMarkCelebrated = (id: string) => {
+    const currentYear = new Date().getFullYear();
+    const celebration: CelebrationHistory = {
+        birthdayId: id,
+        year: currentYear,
+        celebratedAt: new Date().toISOString()
+    };
+    
+    setCelebrations(prev => {
+        if (prev.some(c => c.birthdayId === id && c.year === currentYear)) {
+            return prev;
+        }
+        return [celebration, ...prev];
+    });
+
+    setPopupBirthdays(prev => prev.filter(b => b.id !== id));
+  };
+
   const handleDelete = (id: string) => {
     if (confirm('Remove this birthday?')) {
       setBirthdays(prev => prev.filter(b => b.id !== id));
@@ -233,6 +326,7 @@ export default function App() {
         if (result === 'granted') {
             setNotificationsEnabled(true);
             setIsNotificationModalOpen(false);
+            localStorage.setItem(NOTIF_MUTED_KEY, 'false');
             
             if (navigator.serviceWorker.controller) {
                 navigator.serviceWorker.controller.postMessage({ action: 'sendWelcomeNotification' });
@@ -245,9 +339,15 @@ export default function App() {
         } else {
             setNotificationsEnabled(false);
             setIsNotificationModalOpen(false);
+            localStorage.setItem(NOTIF_MUTED_KEY, 'true');
         }
     } catch (e) {
         console.error("Notification Error:", e);
+    } finally {
+        // Clean onboarding flow sequence: transition to profile welcome screen if first-time user
+        if (!localStorage.getItem(USER_KEY)) {
+            setIsWelcomeOpen(true);
+        }
     }
   };
 
@@ -473,7 +573,14 @@ export default function App() {
                          <h3 className="text-primary font-bold mb-4">Preferences</h3>
                          
                          {/* Notification Toggle */}
-                         <div className="flex justify-between items-center py-4 border-b border-dark-border cursor-pointer" onClick={() => !notificationsEnabled ? setIsNotificationModalOpen(true) : setNotificationsEnabled(false)}>
+                         <div className="flex justify-between items-center py-4 border-b border-dark-border cursor-pointer" onClick={() => {
+                             if (!notificationsEnabled) {
+                                 setIsNotificationModalOpen(true);
+                             } else {
+                                 setNotificationsEnabled(false);
+                                 localStorage.setItem(NOTIF_MUTED_KEY, 'true');
+                             }
+                         }}>
                              <span className="text-muted">Notifications</span>
                              <div 
                                 className={`w-12 h-7 rounded-full p-1 transition-colors duration-300 ease-in-out ${notificationsEnabled ? 'bg-lime' : 'bg-surfaceLight border border-dark-border'}`}
@@ -585,16 +692,19 @@ export default function App() {
         <NotificationPermissionModal
             isOpen={isNotificationModalOpen}
             onEnable={handleRequestNotification}
-            onClose={() => setIsNotificationModalOpen(false)}
+            onClose={() => {
+                setIsNotificationModalOpen(false);
+                if (!localStorage.getItem(USER_KEY)) {
+                    setIsWelcomeOpen(true);
+                }
+            }}
         />
 
         {popupBirthdays.length > 0 && (
             <BirthdayPopup 
                 birthdays={popupBirthdays} 
                 onClose={() => setPopupBirthdays([])}
-                onMarkCelebrated={(id) => {
-                    setPopupBirthdays(prev => prev.filter(b => b.id !== id));
-                }}
+                onMarkCelebrated={handleMarkCelebrated}
             />
         )}
     </div>
