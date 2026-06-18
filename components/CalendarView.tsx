@@ -85,8 +85,8 @@ export const CalendarView: React.FC<Props> = ({ birthdays }) => {
 
           {/* Days Header */}
           <div className="grid grid-cols-7 mb-2">
-            {DAYS.map(d => (
-              <div key={d} className="text-center text-[10px] font-bold text-muted py-2 tracking-widest uppercase">
+            {DAYS.map((d, index) => (
+              <div key={`${d}-${index}`} className="text-center text-[10px] font-bold text-muted py-2 tracking-widest uppercase">
                 {d}
               </div>
             ))}

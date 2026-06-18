@@ -6,7 +6,7 @@ export const parseLocalYMD = (dateString: string): Date => {
     return new Date(year, month - 1, day);
 };
 
-export const calculateDaysUntil = (birthDateString: string): number => {
+export const calculateDaysUntil = (birthDateString: string, leapYearMode: 'Feb28' | 'March1' = 'Feb28'): number => {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
   
@@ -20,14 +20,30 @@ export const calculateDaysUntil = (birthDateString: string): number => {
   if (birth.getMonth() === 1 && birth.getDate() === 29) {
      const isLeap = (year: number) => (year % 4 === 0 && year % 100 !== 0) || (year % 400 === 0);
      if (!isLeap(currentYear)) {
-         // Conventionally celebrate on Feb 28 for non-leap years
-         nextBirthday.setDate(28);
+         if (leapYearMode === 'Feb28') {
+             nextBirthday.setDate(28);
+         } else {
+             nextBirthday.setDate(1);
+             nextBirthday.setMonth(2); // March 1st
+         }
      }
   }
 
   // If birthday passed today (strict comparison), move to next year
   if (nextBirthday < today) {
-    nextBirthday.setFullYear(currentYear + 1);
+    const nextYear = currentYear + 1;
+    nextBirthday = new Date(nextYear, birth.getMonth(), birth.getDate());
+    if (birth.getMonth() === 1 && birth.getDate() === 29) {
+       const isLeap = (year: number) => (year % 4 === 0 && year % 100 !== 0) || (year % 400 === 0);
+       if (!isLeap(nextYear)) {
+           if (leapYearMode === 'Feb28') {
+               nextBirthday.setDate(28);
+           } else {
+               nextBirthday.setDate(1);
+               nextBirthday.setMonth(2); // March 1st
+           }
+       }
+    }
   }
   
   const diffTime = nextBirthday.getTime() - today.getTime();
@@ -53,16 +69,16 @@ export const calculateNextAge = (birthDateString: string): number => {
     return calculateAge(birthDateString) + 1;
 }
 
-export const sortBirthdays = (birthdays: Birthday[]): Birthday[] => {
+export const sortBirthdays = (birthdays: Birthday[], leapYearMode: 'Feb28' | 'March1' = 'Feb28'): Birthday[] => {
   return [...birthdays].sort((a, b) => {
-    const daysA = calculateDaysUntil(a.birthDate);
-    const daysB = calculateDaysUntil(b.birthDate);
+    const daysA = calculateDaysUntil(a.birthDate, leapYearMode);
+    const daysB = calculateDaysUntil(b.birthDate, leapYearMode);
     return daysA - daysB;
   });
 };
 
-export const isToday = (birthDateString: string): boolean => {
-    return calculateDaysUntil(birthDateString) === 0;
+export const isToday = (birthDateString: string, leapYearMode: 'Feb28' | 'March1' = 'Feb28'): boolean => {
+    return calculateDaysUntil(birthDateString, leapYearMode) === 0;
 }
 
 export const formatDateFriendly = (dateString: string): string => {

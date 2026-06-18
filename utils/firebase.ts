@@ -47,11 +47,15 @@ export const getFCMToken = async (): Promise<string | null> => {
       return null;
     }
 
-    // Request browser permissions
-    const permission = await Notification.requestPermission();
-    if (permission !== 'granted') {
-      console.warn("⚠️ Notification permission was denied.");
-      return null;
+    // Request browser permissions safely
+    if (typeof Notification !== 'undefined') {
+      const permission = await Notification.requestPermission();
+      if (permission !== 'granted') {
+        console.warn("⚠️ Notification permission was denied.");
+        return null;
+      }
+    } else {
+      console.warn("⚠️ Notification API is missing on this platform/WebView. Continuing token registration.");
     }
 
     const app = getFirebaseApp();

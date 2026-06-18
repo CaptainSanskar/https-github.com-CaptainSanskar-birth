@@ -1,5 +1,5 @@
 // service-worker.js - Upgraded PWA Production Service Worker
-const CACHE_NAME = 'happy4u-cache-v2';
+const CACHE_NAME = 'happy4u-cache-v3';
 const DB_NAME = 'BirthdayDB';
 const DB_VERSION = 2;
 
@@ -7,10 +7,7 @@ const DB_VERSION = 2;
 const PRECACHE_ASSETS = [
   '/',
   '/index.html',
-  '/manifest.json',
-  '/index.css',
-  '/index.tsx',
-  '/types.ts'
+  '/manifest.json'
 ];
 
 // Install Service Worker

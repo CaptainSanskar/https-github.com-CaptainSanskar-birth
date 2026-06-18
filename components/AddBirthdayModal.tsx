@@ -22,6 +22,7 @@ export const AddBirthdayModal: React.FC<Props> = ({ isOpen, onClose, onSave, ini
   const [date, setDate] = useState('');
   const [relationship, setRelationship] = useState<string>('Friend');
   const [emoji, setEmoji] = useState('🎂');
+  const [selectedReminders, setSelectedReminders] = useState<number[]>([0, 1]);
   const [isClosing, setIsClosing] = useState(false);
 
   useEffect(() => {
@@ -30,12 +31,14 @@ export const AddBirthdayModal: React.FC<Props> = ({ isOpen, onClose, onSave, ini
         setDate(initialData.birthDate);
         setRelationship(initialData.relationship || 'Friend');
         setEmoji(initialData.emoji || '🎂');
+        setSelectedReminders(initialData.reminders || [0, 1]);
     } else {
         // Reset form
         setName('');
         setDate('');
         setRelationship('Friend');
         setEmoji('🎂');
+        setSelectedReminders([0, 1]);
     }
   }, [initialData, isOpen]);
 
@@ -61,6 +64,7 @@ export const AddBirthdayModal: React.FC<Props> = ({ isOpen, onClose, onSave, ini
         emoji,
         notificationEnabled: true,
         createdAt: initialData ? initialData.createdAt : Date.now(),
+        reminders: selectedReminders,
     };
     onSave(newBirthday);
   };
@@ -155,6 +159,50 @@ export const AddBirthdayModal: React.FC<Props> = ({ isOpen, onClose, onSave, ini
                            {rel.label}
                         </button>
                     ))}
+                </div>
+            </div>
+
+            {/* Multiple Reminders selection */}
+            <div className="space-y-3">
+                <label className="text-xs text-muted ml-1 flex justify-between">
+                    <span>Active Alert Reminders</span>
+                    <span className="text-[10px] text-lime font-bold uppercase tracking-wider">Device Local</span>
+                </label>
+                <div className="grid grid-cols-2 gap-2">
+                    {[
+                        { val: 0, label: "On Birthday 🎉" },
+                        { val: 1, label: "1 Day Before ⏰" },
+                        { val: 3, label: "3 Days Before 📅" },
+                        { val: 7, label: "7 Days Before 🔔" }
+                    ].map(opt => {
+                        const active = selectedReminders.includes(opt.val);
+                        return (
+                            <button
+                                key={opt.val}
+                                type="button"
+                                onClick={() => {
+                                    if (active) {
+                                        // Keep at least one reminder active
+                                        if (selectedReminders.length > 1) {
+                                            setSelectedReminders(selectedReminders.filter(r => r !== opt.val));
+                                        }
+                                    } else {
+                                        setSelectedReminders([...selectedReminders, opt.val]);
+                                    }
+                                }}
+                                className={`flex items-center justify-between px-3 py-3 rounded-2xl border text-xs font-semibold uppercase tracking-wide transition-all ${
+                                    active 
+                                    ? 'bg-lime/10 text-lime border-lime/30 font-bold' 
+                                    : 'bg-surfaceLight text-muted border-transparent hover:bg-surfaceLight/80'
+                                }`}
+                            >
+                                <span className="truncate">{opt.label}</span>
+                                <div className={`w-4 h-4 rounded-full flex items-center justify-center border text-[9px] shrink-0 ${active ? 'bg-lime text-black border-lime' : 'border-muted/50'}`}>
+                                    {active && "✓"}
+                                </div>
+                            </button>
+                        );
+                    })}
                 </div>
             </div>
 

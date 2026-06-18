@@ -8,9 +8,21 @@ import { CalendarView } from './components/CalendarView';
 import { WelcomeModal } from './components/WelcomeModal';
 import { NotesView } from './components/NotesView';
 import { NotificationPermissionModal } from './components/NotificationPermissionModal';
-import { syncToIndexedDB, registerServiceWorker, syncSettingToIndexedDB } from './utils/storage';
-import { getFCMToken, isFirebaseConfigured, registerOnMessageListener } from './utils/firebase';
-import { Plus, Calendar as CalendarIcon, Home, Settings, Bell, Gift, Sparkles, Zap, Edit2, Camera, Moon, Sun, StickyNote, Palette, Check, Trash2, Clock, ShieldCheck, Copy, Terminal, ExternalLink } from 'lucide-react';
+import { syncToIndexedDB, registerServiceWorker, syncSettingToIndexedDB, loadBirthdays, saveBirthdayInIndexedDB, deleteBirthdayFromIndexedDB } from './utils/storage';
+import { NotificationInboxModal } from './components/NotificationInboxModal';
+import { InAppNotification } from './types';
+import { 
+  SettingsStore, 
+  BirthdayRepository, 
+  ReminderCalculator, 
+  NotificationScheduler, 
+  NotificationInboxManager, 
+  NotificationReconciliationService,
+  NotificationNativeScheduler,
+  ReconciliationStats
+} from './utils/notifications';
+import { getDiagnostics } from './utils/diagnostics';
+import { Plus, Calendar as CalendarIcon, Home, Settings, Bell, Gift, Sparkles, Zap, Edit2, Camera, Moon, Sun, StickyNote, Palette, Check, Trash2, Clock, ShieldCheck, Copy, Terminal, ExternalLink, Inbox } from 'lucide-react';
 
 const STORAGE_KEY = 'happy4u_birthdays';
 const USER_KEY = 'happy4u_username';
@@ -58,13 +70,39 @@ const ProfileAvatar = ({ name, gender }: { name: string, gender: 'male' | 'femal
     );
 };
 
+const isNativeNotificationSupported = () => {
+    if (typeof window === 'undefined') return false;
+    const Cap = (window as any).Capacitor;
+    if (Cap && Cap.Plugins && Cap.Plugins.LocalNotifications) return true;
+    const cordova = (window as any).cordova;
+    if (cordova && cordova.plugins && cordova.plugins.notification && cordova.plugins.notification.local) return true;
+    const AndroidBridge = (window as any).Android;
+    if (AndroidBridge && typeof AndroidBridge.scheduleNotification === 'function') return true;
+    if ('Notification' in window) return true;
+    return false;
+};
+
 export default function App() {
   const [birthdays, setBirthdays] = useState<Birthday[]>([]);
-  const [username, setUsername] = useState<string>('');
-  const [gender, setGender] = useState<'male' | 'female'>('male');
-  const [themeMode, setThemeMode] = useState<'dark' | 'light'>('dark');
-  const [accentTheme, setAccentTheme] = useState(THEMES[0].id);
-  const [notificationTime, setNotificationTime] = useState<string>('09:00');
+  const [isHydrated, setIsHydrated] = useState<boolean>(false);
+  const [username, setUsername] = useState<string>(() => localStorage.getItem('happy4u_username') || '');
+  const [gender, setGender] = useState<'male' | 'female'>(() => (localStorage.getItem('happy4u_gender') as 'male' | 'female') || 'male');
+  const [themeMode, setThemeMode] = useState<'dark' | 'light'>(() => (localStorage.getItem('happy4u_theme') as 'dark' | 'light') || 'dark');
+  const [accentTheme, setAccentTheme] = useState<string>(() => {
+    const saved = localStorage.getItem('happy4u_accent');
+    if (saved) {
+      const exists = THEMES.find(t => t.id === saved);
+      if (exists) return saved;
+    }
+    return THEMES[0].id;
+  });
+  const [notificationTime, setNotificationTime] = useState<string>(() => localStorage.getItem('happy4u_notif_time') || '09:00');
+  
+  // Custom offset notification times
+  const [notifTimeSameDay, setNotifTimeSameDay] = useState<string>(() => localStorage.getItem('happy4u_notif_time_same_day') || '09:00');
+  const [notifTimeOneDay, setNotifTimeOneDay] = useState<string>(() => localStorage.getItem('happy4u_notif_time_one_day') || '09:00');
+  const [notifTimeThreeDays, setNotifTimeThreeDays] = useState<string>(() => localStorage.getItem('happy4u_notif_time_three_day') || '09:00');
+
   const [view, setView] = useState<'home' | 'list' | 'notes' | 'settings'>('home');
   
   // Modals
@@ -92,107 +130,169 @@ export default function App() {
   const [notificationsEnabled, setNotificationsEnabled] = useState(false);
   const [celebrations, setCelebrations] = useState<CelebrationHistory[]>([]);
 
-  // Appilix / FCM Push States
-  const [fcmToken, setFcmToken] = useState<string | null>(null);
-  const [fcmLoading, setFcmLoading] = useState<boolean>(false);
-  const [fcmError, setTransientFCMError] = useState<string | null>(null);
-  const [fcmConfigured, setFcmConfigured] = useState<boolean>(false);
+  // Configurable Offline system parameters
+  const [leapYearMode, setLeapYearMode] = useState<'Feb28' | 'March1'>(() => (localStorage.getItem('happy4u_leap_year_mode') as 'Feb28' | 'March1') || 'Feb28');
+  const [inAppNotifs, setInAppNotifs] = useState<InAppNotification[]>(() => {
+    const saved = localStorage.getItem('happy4u_inbox_notifications');
+    return saved ? JSON.parse(saved) : [];
+  });
+  const [isInboxOpen, setIsInboxOpen] = useState(false);
 
-  // Check on load if Firebase config is ready
-  useEffect(() => {
-     setFcmConfigured(isFirebaseConfigured());
-  }, []);
+  // Rolling scheduler configuration state
+  const [schedulingWindowDays, setSchedulingWindowDays] = useState<number>(() => NotificationNativeScheduler.getSchedulingWindowDays());
+  const [nativeLimit, setNativeLimit] = useState<number>(() => NotificationNativeScheduler.getNativeLimit());
+  const [reconcileStats, setReconcileStats] = useState<ReconciliationStats | null>(() => NotificationReconciliationService.getLatestStats());
 
-  // Set up foreground FCM listener if active
+  // Global Offset settings (0 = same day, 1 = 1 day before, 3 = 3 days before)
+  const [offsetMuted0, setOffsetMuted0] = useState<boolean>(() => localStorage.getItem('happy4u_offset_muted_0') === 'true');
+  const [offsetMuted1, setOffsetMuted1] = useState<boolean>(() => localStorage.getItem('happy4u_offset_muted_1') === 'true');
+  const [offsetMuted3, setOffsetMuted3] = useState<boolean>(() => localStorage.getItem('happy4u_offset_muted_3') === 'true');
+
+  // Developer mode tap state
+  const [devModeActive, setDevModeActive] = useState<boolean>(() => localStorage.getItem('happy4u_dev_mode') === 'true');
+  const [versionTaps, setVersionTaps] = useState<number>(0);
+  const [diagnosticsData, setDiagnosticsData] = useState<any>(null);
+
   useEffect(() => {
-     if (isFirebaseConfigured()) {
-         registerOnMessageListener((payload) => {
-             alert(`Push notification received in foreground! \n\nTitle: ${payload.notification?.title || payload.data?.title || 'FCM Push'}\nBody: ${payload.notification?.body || payload.data?.body || ''}`);
-         });
-     }
-  }, []);
+    if (devModeActive) {
+      getDiagnostics().then(setDiagnosticsData).catch(console.error);
+    }
+  }, [devModeActive]);
+
+  // Core unified reconciliation and sync trigger helper
+  const runReconciliation = () => {
+    NotificationReconciliationService.reconcile().then(() => {
+      setReconcileStats(NotificationReconciliationService.getLatestStats());
+      setInAppNotifs(NotificationInboxManager.getInbox());
+    });
+  };
+
+  useEffect(() => {
+    localStorage.setItem('happy4u_offset_muted_0', offsetMuted0 ? 'true' : 'false');
+    runReconciliation();
+  }, [offsetMuted0]);
+
+  useEffect(() => {
+    localStorage.setItem('happy4u_offset_muted_1', offsetMuted1 ? 'true' : 'false');
+    runReconciliation();
+  }, [offsetMuted1]);
+
+  useEffect(() => {
+    localStorage.setItem('happy4u_offset_muted_3', offsetMuted3 ? 'true' : 'false');
+    runReconciliation();
+  }, [offsetMuted3]);
+
+  // Sync state mutations locally and trigger reconciliation
+  useEffect(() => {
+    localStorage.setItem('happy4u_leap_year_mode', leapYearMode);
+    syncSettingToIndexedDB('leapYearMode', leapYearMode);
+    runReconciliation();
+  }, [leapYearMode]);
+
+  useEffect(() => {
+    localStorage.setItem('happy4u_notif_time_same_day', notifTimeSameDay);
+    localStorage.setItem('happy4u_notif_time', notifTimeSameDay); // Fallback Compatibility
+    syncSettingToIndexedDB('notif_time_same_day', notifTimeSameDay);
+    syncSettingToIndexedDB('notificationTime', notifTimeSameDay);
+    runReconciliation();
+  }, [notifTimeSameDay]);
+
+  useEffect(() => {
+    localStorage.setItem('happy4u_notif_time_one_day', notifTimeOneDay);
+    syncSettingToIndexedDB('notif_time_one_day', notifTimeOneDay);
+    runReconciliation();
+  }, [notifTimeOneDay]);
+
+  useEffect(() => {
+    localStorage.setItem('happy4u_notif_time_three_day', notifTimeThreeDays);
+    syncSettingToIndexedDB('notif_time_three_day', notifTimeThreeDays);
+    runReconciliation();
+  }, [notifTimeThreeDays]);
+
+  useEffect(() => {
+    localStorage.setItem('happy4u_inbox_notifications', JSON.stringify(inAppNotifs));
+  }, [inAppNotifs]);
 
   // Load data
   useEffect(() => {
     // 1. Register Service Worker for background notifications
     registerServiceWorker();
 
-    // 2. Load Data
-    const savedBirthdays = localStorage.getItem(STORAGE_KEY);
-    const savedUser = localStorage.getItem(USER_KEY);
-    const savedGender = localStorage.getItem(GENDER_KEY);
-    const savedTheme = localStorage.getItem(THEME_KEY);
-    const savedAccent = localStorage.getItem(ACCENT_KEY);
-    const savedNotifTime = localStorage.getItem(NOTIF_TIME_KEY);
-    const savedCelebrations = localStorage.getItem(CELEBRATIONS_KEY);
+    // 2. Load birthdays asynchronously and hydrate
+    loadBirthdays().then((dbBirthdays) => {
+      setBirthdays(dbBirthdays);
+      setIsHydrated(true);
 
-    if (savedBirthdays) {
-      try {
-        const parsed = JSON.parse(savedBirthdays);
-        setBirthdays(parsed);
-        // Sync loaded data to IndexedDB immediately
-        syncToIndexedDB(parsed);
-      } catch (e) {
-        console.error("Failed to parse birthdays", e);
+      if (!username) {
+          // First-time user onboarding sequence!
+          // Show the notification permission request as the absolute first screen if default
+          if ('Notification' in window && Notification.permission === 'default') {
+              setIsNotificationModalOpen(true);
+          } else {
+              // Already handled or not supported, go straight to welcome profile creation
+              setIsWelcomeOpen(true);
+          }
       }
-    }
+    }).catch(err => {
+      console.error("Critical: failed to hydrate birthdays on startup", err);
+      setIsHydrated(true);
+    });
 
-    if (savedUser) {
-        setUsername(savedUser);
-    } else {
-        // First-time user onboarding sequence!
-        // Show the notification permission request as the absolute first screen if default
-        if ('Notification' in window && Notification.permission === 'default') {
-            setIsNotificationModalOpen(true);
-        } else {
-            // Already handled or not supported, go straight to welcome profile creation
-            setIsWelcomeOpen(true);
-        }
-    }
-
-    if (savedGender) {
-        setGender(savedGender as 'male' | 'female');
-    }
-
-    if (savedTheme) {
-        setThemeMode(savedTheme as 'dark' | 'light');
-    }
-
-    if (savedAccent) {
-        const exists = THEMES.find(t => t.id === savedAccent);
-        if (exists) setAccentTheme(savedAccent);
-    }
-
-    if (savedNotifTime) {
-        setNotificationTime(savedNotifTime);
-    }
-
-    if (savedCelebrations) {
-      try {
-        setCelebrations(JSON.parse(savedCelebrations));
-      } catch (e) {
-        console.error("Failed to parse celebrations", e);
-      }
-    }
-    
     // Check initial notification status (only auto-prompts on timer for returned active users)
-    const savedNotifMuted = localStorage.getItem(NOTIF_MUTED_KEY) === 'true';
+    const savedNotifMuted = localStorage.getItem(NOTIF_MUTED_KEY);
     if ('Notification' in window) {
-        if (Notification.permission === 'granted' && !savedNotifMuted) {
+        if (Notification.permission === 'granted' && savedNotifMuted !== 'true') {
             setNotificationsEnabled(true);
-        } else if (Notification.permission === 'default' && !savedNotifMuted) {
+        } else if (Notification.permission === 'default' && savedNotifMuted !== 'true') {
             setTimeout(() => {
-                if (savedUser) setIsNotificationModalOpen(true);
+                if (username) setIsNotificationModalOpen(true);
             }, 3000);
         } else {
             setNotificationsEnabled(false);
         }
+    } else {
+        // Fallback for WebViews/APKs without standard window.Notification object
+        if (savedNotifMuted === 'false') {
+            setNotificationsEnabled(true);
+        } else if (savedNotifMuted === 'true') {
+            setNotificationsEnabled(false);
+        } else {
+            // Default to notifications active on first install for mobile APK users
+            setNotificationsEnabled(true);
+            localStorage.setItem(NOTIF_MUTED_KEY, 'false');
+        }
     }
+  }, []);
+
+  // Periodic Focus & Launch Idempotent Reconciliation Pass
+  useEffect(() => {
+    runReconciliation();
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        runReconciliation();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('focus', handleVisibilityChange);
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('focus', handleVisibilityChange);
+    };
   }, []);
 
   const handleWelcomeClose = () => {
       setIsWelcomeOpen(false);
-      if ('Notification' in window && Notification.permission === 'default') {
+      if (!('Notification' in window)) {
+          // If in WebView/APK, enable in-app notifications right away by default on onboarding complete
+          setNotificationsEnabled(true);
+          localStorage.setItem(NOTIF_MUTED_KEY, 'false');
+          return;
+      }
+      const savedNotifMuted = localStorage.getItem(NOTIF_MUTED_KEY);
+      if (savedNotifMuted !== 'true' && savedNotifMuted !== 'false') {
           setTimeout(() => setIsNotificationModalOpen(true), 1000);
       }
   };
@@ -223,6 +323,7 @@ export default function App() {
 
   useEffect(() => {
       syncSettingToIndexedDB('notificationsEnabled', notificationsEnabled);
+      runReconciliation();
   }, [notificationsEnabled]);
 
   useEffect(() => {
@@ -250,9 +351,11 @@ export default function App() {
   }, [birthdays]);
 
   useEffect(() => {
+    if (!isHydrated) return;
     localStorage.setItem(STORAGE_KEY, JSON.stringify(birthdays));
     syncToIndexedDB(birthdays);
-  }, [birthdays]);
+    runReconciliation();
+  }, [birthdays, isHydrated]);
 
   useEffect(() => {
     localStorage.setItem(CELEBRATIONS_KEY, JSON.stringify(celebrations));
@@ -292,6 +395,151 @@ export default function App() {
     }
   }, [birthdays, shownPopups]);
 
+  const handleBackup = () => {
+    try {
+      const backupData = {
+         birthdays: JSON.parse(localStorage.getItem('happy4u_birthdays') || '[]'),
+         notes: JSON.parse(localStorage.getItem('cakewait_notes') || '[]'),
+         leapYearMode: localStorage.getItem('happy4u_leap_year_mode') || 'Feb28',
+         accentTheme: localStorage.getItem('happy4u_accent_theme') || 'Classic',
+         themeMode: localStorage.getItem('happy4u_theme_mode') || 'dark',
+         notifTimeSameDay: localStorage.getItem('happy4u_notif_time_same_day') || '09:00',
+         notifTimeOneDay: localStorage.getItem('happy4u_notif_time_one_day') || '09:00',
+         notifTimeThreeDay: localStorage.getItem('happy4u_notif_time_three_day') || '09:00',
+         offsetMuted0: localStorage.getItem('happy4u_offset_muted_0') === 'true',
+         offsetMuted1: localStorage.getItem('happy4u_offset_muted_1') === 'true',
+         offsetMuted3: localStorage.getItem('happy4u_offset_muted_3') === 'true'
+      };
+      
+      const blob = new Blob([JSON.stringify(backupData, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `happy4u_backup_${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      alert('Failed to generate backup: ' + e);
+    }
+  };
+
+  const handleRestore = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = async (e) => {
+      try {
+        const json = JSON.parse(e.target?.result as string);
+        
+        if (!json || (json.birthdays && !Array.isArray(json.birthdays))) {
+           alert('Invalid backup file structure.');
+           return;
+        }
+
+        if (confirm('Restore data? This will overwrite your current birthdays, notes, and settings.')) {
+           if (json.birthdays) {
+              localStorage.setItem('happy4u_birthdays', JSON.stringify(json.birthdays));
+              setBirthdays(json.birthdays);
+           }
+           if (json.notes) {
+              localStorage.setItem('cakewait_notes', JSON.stringify(json.notes));
+           }
+           if (json.leapYearMode) {
+              setLeapYearMode(json.leapYearMode);
+              localStorage.setItem('happy4u_leap_year_mode', json.leapYearMode);
+           }
+           if (json.accentTheme) {
+              setAccentTheme(json.accentTheme);
+              localStorage.setItem('happy4u_accent_theme', json.accentTheme);
+           }
+           if (json.notifTimeSameDay) {
+              setNotifTimeSameDay(json.notifTimeSameDay);
+           }
+           if (json.notifTimeOneDay) {
+              setNotifTimeOneDay(json.notifTimeOneDay);
+           }
+           if (json.notifTimeThreeDay) {
+              setNotifTimeThreeDays(json.notifTimeThreeDay);
+           }
+           
+           localStorage.setItem('happy4u_offset_muted_0', json.offsetMuted0 ? 'true' : 'false');
+           localStorage.setItem('happy4u_offset_muted_1', json.offsetMuted1 ? 'true' : 'false');
+           localStorage.setItem('happy4u_offset_muted_3', json.offsetMuted3 ? 'true' : 'false');
+
+           alert('Data restored successfully! The application will refresh.');
+           window.location.reload();
+        }
+      } catch (err) {
+        alert('Failed to parse backup file: ' + err);
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  const sendTestNotification = async () => {
+    const testId = `test-${Date.now()}`;
+    const testNotif: InAppNotification = {
+        id: testId,
+        title: 'Happy4U Notification Test 🎈',
+        body: 'Warmest birthday wishes from Happy4U! Your automatic synchronization engine is fully active.',
+        timestamp: Date.now(),
+        read: false,
+        birthdayId: 'test',
+        type: 'test'
+    };
+    setInAppNotifs(prev => [testNotif, ...prev]);
+
+    const isNative = typeof window !== 'undefined' && (!!(window as any).Capacitor || !!(window as any).cordova || !!(window as any).Android);
+    if (isNative) {
+        const Cap = (window as any).Capacitor;
+        if (Cap && Cap.Plugins && Cap.Plugins.LocalNotifications) {
+            try {
+                await Cap.Plugins.LocalNotifications.schedule({
+                    notifications: [{
+                        id: 999999,
+                        title: 'Happy4U Notification Test 🎈',
+                        body: 'Warmest birthday wishes from Happy4U! Your automatic synchronization engine is fully active.',
+                        extra: { birthdayId: 'test' }
+                    }]
+                });
+                return;
+            } catch (e) {
+                console.error("Capacitor test failed", e);
+            }
+        }
+    }
+
+    if ('Notification' in window) {
+        if (Notification.permission === 'granted') {
+            new Notification('Happy4U Notification Test 🎈', {
+                body: 'Warmest birthday wishes from Happy4U! Your automatic synchronization engine is fully active.',
+                icon: 'https://cdn-icons-png.flaticon.com/512/4213/4213652.png'
+            });
+        } else {
+            alert('Test Notification: Warmest birthday wishes from Happy4U! (Please grant notification permissions details to see browser-level push alerts)');
+        }
+    } else {
+        alert('Test Notification: Warmest birthday wishes from Happy4U!');
+    }
+  };
+
+  const handleVersionClick = () => {
+     setVersionTaps(prev => {
+        const next = prev + 1;
+        if (next >= 7) {
+           const nextMode = !devModeActive;
+           setDevModeActive(nextMode);
+           localStorage.setItem('happy4u_dev_mode', nextMode ? 'true' : 'false');
+           alert(nextMode ? 'Developer Mode Unlocked! Telemetry & internal schedules are now visible.' : 'Developer Mode Disabled.');
+           return 0;
+        }
+        return next;
+     });
+  };
+
   const handleAddOrUpdate = (birthday: Birthday) => {
     if (editingId) {
       setBirthdays(prev => prev.map(b => b.id === editingId ? birthday : b));
@@ -323,6 +571,7 @@ export default function App() {
   const handleDelete = (id: string) => {
     if (confirm('Remove this birthday?')) {
       setBirthdays(prev => prev.filter(b => b.id !== id));
+      setInAppNotifs(prev => prev.filter(n => n.birthdayId !== id));
     }
   };
 
@@ -333,7 +582,23 @@ export default function App() {
 
   const handleRequestNotification = async () => {
     if (!('Notification' in window)) {
-        alert('Notifications not supported on this device');
+        setNotificationsEnabled(true);
+        setIsNotificationModalOpen(false);
+        localStorage.setItem(NOTIF_MUTED_KEY, 'false');
+        
+        // Instant local test notification confirming that reminders are working
+        const testId = `test-${Date.now()}`;
+        const testNotif: InAppNotification = {
+            id: testId,
+            title: 'Notifications Enabled 🎉',
+            body: 'Your birthday reminders are now active.',
+            timestamp: Date.now(),
+            read: false,
+            birthdayId: 'test',
+            type: 'test'
+        };
+        setInAppNotifs(prev => [testNotif, ...prev]);
+        alert("Notifications Enabled 🎉\nYour birthday reminders are now active.");
         return;
     }
     
@@ -349,14 +614,22 @@ export default function App() {
             setIsNotificationModalOpen(false);
             localStorage.setItem(NOTIF_MUTED_KEY, 'false');
             
-            if (navigator.serviceWorker.controller) {
-                navigator.serviceWorker.controller.postMessage({ action: 'sendWelcomeNotification' });
-            } else {
-                new Notification('Notifications Enabled! 🔔', {
-                    body: 'Happy4U will remind you about upcoming birthdays.',
-                    icon: 'https://cdn-icons-png.flaticon.com/512/4213/4213652.png'
-                });
-            }
+            const testId = `test-${Date.now()}`;
+            const testNotif: InAppNotification = {
+                id: testId,
+                title: 'Notifications Enabled 🎉',
+                body: 'Your birthday reminders are now active.',
+                timestamp: Date.now(),
+                read: false,
+                birthdayId: 'test',
+                type: 'test'
+            };
+            setInAppNotifs(prev => [testNotif, ...prev]);
+
+            new Notification('Notifications Enabled 🎉', {
+                body: 'Your birthday reminders are now active.',
+                icon: 'https://cdn-icons-png.flaticon.com/512/4213/4213652.png'
+            });
         } else {
             setNotificationsEnabled(false);
             setIsNotificationModalOpen(false);
@@ -365,14 +638,13 @@ export default function App() {
     } catch (e) {
         console.error("Notification Error:", e);
     } finally {
-        // Clean onboarding flow sequence: transition to profile welcome screen if first-time user
         if (!localStorage.getItem(USER_KEY)) {
             setIsWelcomeOpen(true);
         }
     }
   };
 
-  const sortedBirthdays = useMemo(() => sortBirthdays(birthdays), [birthdays]);
+  const sortedBirthdays = useMemo(() => sortBirthdays(birthdays, leapYearMode), [birthdays, leapYearMode]);
   const nextBirthday = sortedBirthdays[0];
 
   return (
@@ -417,11 +689,16 @@ export default function App() {
             </div>
             
             <button 
-                onClick={() => setIsNotificationModalOpen(true)}
-                className={`w-10 h-10 rounded-full border border-dark-border flex items-center justify-center transition-all active:scale-90 ${notificationsEnabled ? 'bg-lime/10 text-lime border-lime/20' : 'bg-surfaceLight text-muted'}`}
-                aria-label="Notification Settings"
+                onClick={() => setIsInboxOpen(true)}
+                className="w-10 h-10 rounded-full border border-dark-border flex items-center justify-center relative transition-all active:scale-90 bg-surfaceLight text-muted hover:text-lime hover:border-lime/30 cursor-pointer"
+                aria-label="Notification Center"
             >
                 <Bell className="w-5 h-5" />
+                {inAppNotifs.filter(n => !n.read).length > 0 && (
+                    <span className="absolute -top-1 -right-1 w-5 h-5 rounded-full bg-lime text-black font-extrabold text-[10px] flex items-center justify-center animate-pulse shadow-sm shadow-lime/30">
+                        {inAppNotifs.filter(n => !n.read).length}
+                    </span>
+                )}
             </button>
         </header>
 
@@ -566,6 +843,8 @@ export default function App() {
             
              {view === 'settings' && (
                 <div className="space-y-6 pt-4 pb-20">
+                    
+                    {/* App Mood Card */}
                     <div className="bg-dark-card border border-dark-border rounded-3xl p-6 animate-scale-in" style={{ animationDelay: '0ms' }}>
                          <div className="flex items-center gap-2 mb-4">
                             <Palette size={18} className="text-lime" />
@@ -590,11 +869,32 @@ export default function App() {
                          </div>
                     </div>
 
-                    <div className="bg-dark-card border border-dark-border rounded-3xl p-6 animate-scale-in" style={{ animationDelay: '100ms', animationFillMode: 'backwards' }}>
-                         <h3 className="text-primary font-bold mb-4">Preferences</h3>
+                    {/* Preferences/Notifications Section */}
+                    <div className="bg-dark-card border border-dark-border rounded-3xl p-6 animate-scale-in space-y-6" style={{ animationDelay: '100ms', animationFillMode: 'backwards' }}>
+                         <div className="flex items-center gap-2">
+                             <Clock size={18} className="text-lime" />
+                             <h3 className="text-primary font-bold">Notifications</h3>
+                         </div>
+
+                         {!isNativeNotificationSupported() && (
+                             <div className="bg-red-500/10 border border-red-500/30 rounded-2xl p-4 text-[11px] text-red-200 space-y-1">
+                                 <span className="font-bold flex items-center gap-1.5 uppercase tracking-wide text-red-400">
+                                     ⚠️ Warning
+                                 </span>
+                                 <span className="block text-slate-300 font-medium">
+                                     Native local notification APIs are unavailable in this environment.
+                                 </span>
+                             </div>
+                         )}
                          
-                         {/* Notification Toggle */}
-                         <div className="flex justify-between items-center py-4 border-b border-dark-border cursor-pointer" onClick={() => {
+                         {/* Notification Master Toggle */}
+                         <div className="flex justify-between items-center py-2 border-b border-dark-border cursor-pointer" onClick={() => {
+                             if (!('Notification' in window)) {
+                                 const nextVal = !notificationsEnabled;
+                                 setNotificationsEnabled(nextVal);
+                                 localStorage.setItem(NOTIF_MUTED_KEY, nextVal ? 'false' : 'true');
+                                 return;
+                             }
                              if (!notificationsEnabled) {
                                  setIsNotificationModalOpen(true);
                              } else {
@@ -602,7 +902,10 @@ export default function App() {
                                  localStorage.setItem(NOTIF_MUTED_KEY, 'true');
                              }
                          }}>
-                             <span className="text-muted">Notifications</span>
+                             <div className="space-y-1">
+                                 <span className="text-xs text-primary font-bold block">Enable Notifications</span>
+                                 <span className="text-[10px] text-muted block">Alerts on device local storage</span>
+                             </div>
                              <div 
                                 className={`w-12 h-7 rounded-full p-1 transition-colors duration-300 ease-in-out ${notificationsEnabled ? 'bg-lime' : 'bg-surfaceLight border border-dark-border'}`}
                              >
@@ -610,23 +913,99 @@ export default function App() {
                              </div>
                          </div>
 
-                         {/* Notification Time Setting */}
-                         <div className="flex justify-between items-center py-4 border-b border-dark-border">
-                             <div className="flex items-center gap-2">
-                                <Clock size={16} className="text-muted" />
-                                <span className="text-muted">Reminder Time</span>
+                         {/* Offsets (same day, 1 day, 3 days) Toggles + Times */}
+                         <div className="space-y-4">
+                             <span className="text-xs text-primary font-bold block">Active Reminder Offsets</span>
+                             
+                             {/* On Birthday */}
+                             <div className="flex flex-col sm:flex-row justify-between sm:items-center bg-surfaceLight border border-dark-border rounded-2xl p-4 gap-3">
+                                 <div className="flex items-center gap-2">
+                                     <button 
+                                        onClick={() => setOffsetMuted0(!offsetMuted0)}
+                                        className={`w-10 h-10 rounded-xl flex items-center justify-center transition-colors ${!offsetMuted0 ? 'bg-lime/10 text-lime border border-lime/30' : 'bg-dark-card text-muted border border-dark-border'}`}
+                                     >
+                                         <Check size={16} strokeWidth={!offsetMuted0 ? 3 : 2} />
+                                     </button>
+                                     <div className="space-y-0.5">
+                                         <span className="text-xs text-primary font-bold block">On Birthday Day</span>
+                                         <span className="text-[10px] text-muted block">Alert on actual birth date</span>
+                                     </div>
+                                 </div>
+                                 <div className="flex items-center gap-3">
+                                     <span className="text-[10px] text-muted font-bold font-mono uppercase">Time:</span>
+                                     <input 
+                                        type="time" 
+                                        disabled={offsetMuted0}
+                                        value={notifTimeSameDay}
+                                        onChange={(e) => {
+                                            setNotifTimeSameDay(e.target.value);
+                                            setNotificationTime(e.target.value);
+                                        }}
+                                        className="bg-dark-card border border-dark-border rounded-xl px-3 py-1.5 text-primary text-sm font-bold focus:outline-none focus:border-lime disabled:opacity-30 transition-colors"
+                                     />
+                                 </div>
                              </div>
-                             <input 
-                                type="time" 
-                                value={notificationTime}
-                                onChange={(e) => setNotificationTime(e.target.value)}
-                                className="bg-surfaceLight border border-dark-border rounded-xl px-3 py-1.5 text-primary text-sm font-bold focus:outline-none focus:border-lime transition-colors"
-                             />
+
+                             {/* 1 Day Before */}
+                             <div className="flex flex-col sm:flex-row justify-between sm:items-center bg-surfaceLight border border-dark-border rounded-2xl p-4 gap-3">
+                                 <div className="flex items-center gap-2">
+                                     <button 
+                                        onClick={() => setOffsetMuted1(!offsetMuted1)}
+                                        className={`w-10 h-10 rounded-xl flex items-center justify-center transition-colors ${!offsetMuted1 ? 'bg-lime/10 text-lime border border-lime/30' : 'bg-dark-card text-muted border border-dark-border'}`}
+                                     >
+                                         <Check size={16} strokeWidth={!offsetMuted1 ? 3 : 2} />
+                                     </button>
+                                     <div className="space-y-0.5">
+                                         <span className="text-xs text-primary font-bold block">1 Day Before</span>
+                                         <span className="text-[10px] text-muted block">Advance gentle reminder</span>
+                                     </div>
+                                 </div>
+                                 <div className="flex items-center gap-3">
+                                     <span className="text-[10px] text-muted font-bold font-mono uppercase">Time:</span>
+                                     <input 
+                                        type="time" 
+                                        disabled={offsetMuted1}
+                                        value={notifTimeOneDay}
+                                        onChange={(e) => setNotifTimeOneDay(e.target.value)}
+                                        className="bg-dark-card border border-dark-border rounded-xl px-3 py-1.5 text-primary text-sm font-bold focus:outline-none focus:border-lime disabled:opacity-30 transition-colors"
+                                     />
+                                 </div>
+                             </div>
+
+                             {/* 3 Days Before */}
+                             <div className="flex flex-col sm:flex-row justify-between sm:items-center bg-surfaceLight border border-dark-border rounded-2xl p-4 gap-3">
+                                 <div className="flex items-center gap-2">
+                                     <button 
+                                        onClick={() => setOffsetMuted3(!offsetMuted3)}
+                                        className={`w-10 h-10 rounded-xl flex items-center justify-center transition-colors ${!offsetMuted3 ? 'bg-lime/10 text-lime border border-lime/30' : 'bg-dark-card text-muted border border-dark-border'}`}
+                                     >
+                                         <Check size={16} strokeWidth={!offsetMuted3 ? 3 : 2} />
+                                     </button>
+                                     <div className="space-y-0.5">
+                                         <span className="text-xs text-primary font-bold block">3 Days Before</span>
+                                         <span className="text-[10px] text-muted block">Planning & gift preparation</span>
+                                     </div>
+                                 </div>
+                                 <div className="flex items-center gap-3">
+                                     <span className="text-[10px] text-muted font-bold font-mono uppercase">Time:</span>
+                                     <input 
+                                        type="time" 
+                                        disabled={offsetMuted3}
+                                        value={notifTimeThreeDays}
+                                        onChange={(e) => setNotifTimeThreeDays(e.target.value)}
+                                        className="bg-dark-card border border-dark-border rounded-xl px-3 py-1.5 text-primary text-sm font-bold focus:outline-none focus:border-lime disabled:opacity-30 transition-colors"
+                                     />
+                                 </div>
+                             </div>
                          </div>
-                         
-                         <div className="flex justify-between items-center py-4 cursor-pointer" onClick={() => setThemeMode(themeMode === 'dark' ? 'light' : 'dark')}>
-                             <span className="text-muted">Theme</span>
-                             <div className="flex items-center gap-2 bg-surfaceLight border border-dark-border rounded-full p-1">
+
+                         {/* Theme Selectors Mode (Light vs. Dark) */}
+                         <div className="flex justify-between items-center py-4 border-t border-dark-border cursor-pointer" onClick={() => setThemeMode(themeMode === 'dark' ? 'light' : 'dark')}>
+                             <div className="space-y-0.5">
+                                 <span className="text-xs text-primary font-bold block">Theme Mode</span>
+                                 <span className="text-[10px] text-muted block">Seamless toggle between modes</span>
+                             </div>
+                             <div className="flex items-center gap-2 bg-surfaceLight border border-dark-border rounded-full p-1 h-9">
                                 <div className={`p-1.5 rounded-full transition-all ${themeMode === 'dark' ? 'bg-dark-card shadow text-white' : 'text-muted'}`}>
                                     <Moon size={14} />
                                 </div>
@@ -635,102 +1014,341 @@ export default function App() {
                                 </div>
                              </div>
                          </div>
+
+                         {/* Test Notification button */}
+                         <button 
+                             onClick={sendTestNotification}
+                             className="w-full py-4 rounded-2xl bg-surfaceLight border border-dark-border text-xs text-primary font-bold flex items-center justify-center gap-2 active:scale-[0.98] transition-all hover:bg-lime hover:text-black hover:border-lime cursor-pointer uppercase tracking-wider"
+                         >
+                             <Sparkles size={14} />
+                             Test Local Notification
+                         </button>
                     </div>
-                    
+
+                    {/* Leap Year Rule */}
                     <div className="bg-dark-card border border-dark-border rounded-3xl p-6 animate-scale-in" style={{ animationDelay: '150ms', animationFillMode: 'backwards' }}>
-                         <div className="flex items-center gap-2 mb-4">
-                            <Terminal size={18} className="text-lime" />
-                            <h3 className="text-primary font-bold">Appilix FCM Diagnostics</h3>
+                        <div className="flex items-center gap-2 mb-2">
+                            <Clock size={18} className="text-lime" />
+                            <h3 className="text-primary font-bold">Leap Year Handling</h3>
+                        </div>
+                        <p className="text-xs text-muted leading-relaxed mb-4">
+                            Choose when to trigger reminders for birthdays occurring on Leap Day (<b>29 February</b>) during standard non-leap years.
+                        </p>
+
+                        <div className="grid grid-cols-2 gap-2 p-1.5 bg-surfaceLight border border-dark-border rounded-2xl">
+                            <button
+                                onClick={() => setLeapYearMode('Feb28')}
+                                className={`py-3.5 px-4 rounded-xl text-xs font-bold transition-all uppercase tracking-wide cursor-pointer ${
+                                    leapYearMode === 'Feb28'
+                                    ? 'bg-lime text-black shadow-lg shadow-lime/15 font-extrabold'
+                                    : 'text-muted hover:text-primary'
+                                }`}
+                            >
+                                Feb 28 📅
+                            </button>
+                            <button
+                                onClick={() => setLeapYearMode('March1')}
+                                className={`py-3.5 px-4 rounded-xl text-xs font-bold transition-all uppercase tracking-wide cursor-pointer ${
+                                    leapYearMode === 'March1'
+                                    ? 'bg-lime text-black shadow-lg shadow-lime/15 font-extrabold'
+                                    : 'text-muted hover:text-primary'
+                                }`}
+                            >
+                                March 1 🎈
+                            </button>
+                        </div>
+                    </div>
+
+                    {/* Data Backup & Restore */}
+                    <div className="bg-dark-card border border-dark-border rounded-3xl p-6 animate-scale-in space-y-4" style={{ animationDelay: '200ms', animationFillMode: 'backwards' }}>
+                         <div className="flex items-center gap-2 mb-1">
+                            <Trash2 size={18} className="text-lime" />
+                            <h3 className="text-primary font-bold">Backup & Data Sovereignty</h3>
                          </div>
-                         
-                         <p className="text-xs text-muted leading-relaxed mb-4">
-                            Appilix WebView apps rely on <b>Firebase Cloud Messaging (FCM)</b> to deliver native push alerts. Use this panel to register and copy your device registration token.
+                         <p className="text-xs text-muted leading-relaxed">
+                             All birthday records and Sticky Notes reside safely inside your physical device local sandbox storage. Backup to a local json file to secure your data.
                          </p>
 
-                         {!fcmConfigured ? (
-                             <div className="bg-amber-500/10 border border-amber-500/20 rounded-2xl p-4 text-xs text-amber-300 leading-relaxed mb-4 flex flex-col gap-1">
-                                 <p className="font-bold">Configuration Needed ⚠️</p>
-                                 <p className="opacity-90">
-                                     Your web environment does not have FCM configuration variables initialized. Add your Keys with the VITE_ prefix inside your `.env` file to activate.
-                                 </p>
-                             </div>
-                         ) : (
-                             <div className="space-y-4">
-                                 {fcmToken ? (
-                                     <div className="space-y-2">
-                                         <p className="text-xs text-lime font-bold">✓ FCM Active & Registered!</p>
-                                         <div className="bg-surfaceLight border border-dark-border rounded-2xl p-3 flex flex-col gap-2 relative">
-                                             <span className="text-[10px] text-muted font-mono uppercase tracking-wider">Device Push Token:</span>
-                                             <textarea 
-                                                 readOnly 
-                                                 value={fcmToken} 
-                                                 className="w-full bg-transparent text-xs text-muted font-mono border-0 focus:outline-none focus:ring-0 resize-none h-16 leading-relaxed select-all"
-                                             />
-                                             <button
-                                                 onClick={() => {
-                                                     navigator.clipboard.writeText(fcmToken || "");
-                                                     alert("Token copied to clipboard!");
-                                                 }}
-                                                 className="self-end bg-lime/10 hover:bg-lime/20 text-lime font-bold py-1.5 px-3 rounded-xl text-xs flex items-center gap-1.5 transition-colors cursor-pointer"
-                                             >
-                                                 <Copy size={12} />
-                                                 Copy Token
-                                             </button>
-                                         </div>
-                                         <p className="text-[11px] text-muted leading-relaxed">
-                                             Use the <b>Firebase Console</b> to send a push message targeting this token to verify notifications deliver correctly to this device!
-                                         </p>
-                                     </div>
-                                 ) : (
-                                     <button 
-                                         onClick={async () => {
-                                             setFcmLoading(true);
-                                             setTransientFCMError(null);
-                                             try {
-                                                 const token = await getFCMToken();
-                                                 if (token) {
-                                                     setFcmToken(token);
-                                                  } else {
-                                                     setTransientFCMError("Could not retrieve token. Ensure user allowed notifications.");
-                                                  }
-                                             } catch (err: any) {
-                                                 setTransientFCMError(err.message || "Failed to initialize FCM token retrieval.");
-                                             } finally {
-                                                 setFcmLoading(false);
-                                             }
-                                         }}
-                                         disabled={fcmLoading}
-                                         className="w-full bg-lime hover:bg-lime-dim text-black font-bold py-3.5 rounded-2xl flex items-center justify-center gap-2 shadow-lg shadow-lime/10 transition-all active:scale-95 text-sm cursor-pointer disabled:opacity-55"
-                                     >
-                                         <ShieldCheck size={18} />
-                                         {fcmLoading ? 'Fetching FCM Token...' : 'Register FCM Push Token'}
-                                     </button>
-                                 )}
-                                 
-                                 {fcmError && (
-                                     <p className="text-xs text-red-400 mt-2 font-medium">⚠️ {fcmError}</p>
-                                 )}
-                             </div>
-                         )}
-                    </div>
+                         <div className="grid grid-cols-2 gap-3 pt-2">
+                             <button 
+                                 onClick={handleBackup}
+                                 className="py-3.5 px-4 rounded-2xl bg-surfaceLight border border-dark-border text-xs text-primary font-bold transition-transform active:scale-[0.98] hover:bg-surfaceLight/80 flex items-center justify-center gap-1.5"
+                             >
+                                 Backup File
+                             </button>
+                             <label 
+                                 className="py-3.5 px-4 rounded-2xl bg-surfaceLight border border-dark-border text-xs text-primary font-bold transition-transform active:scale-[0.98] hover:bg-surfaceLight/80 flex items-center justify-center gap-1.5 cursor-pointer text-center"
+                             >
+                                 Restore File
+                                 <input 
+                                     type="file" 
+                                     accept=".json"
+                                     onChange={handleRestore}
+                                     className="hidden" 
+                                 />
+                             </label>
+                         </div>
 
-                    <div className="bg-dark-card border border-dark-border rounded-3xl p-6 animate-scale-in" style={{ animationDelay: '200ms', animationFillMode: 'backwards' }}>
-                         <h3 className="text-primary font-bold mb-4">Data</h3>
                          <button 
-                            onClick={() => {
-                                if (confirm('Reset all data? This cannot be undone.')) {
-                                    localStorage.clear();
-                                    window.location.reload();
-                                }
-                            }}
-                            className="w-full py-4 rounded-3xl bg-surfaceLight text-red-400 font-medium border border-dark-border active:scale-[0.98] transition-transform hover:bg-red-500/5 hover:border-red-500/30 flex items-center justify-center gap-2"
-                        >
-                            <Trash2 size={18} />
-                            Reset All Data
-                        </button>
+                             onClick={() => {
+                                 if (confirm('Reset all details? This completely purges your local database.')) {
+                                     localStorage.clear();
+                                     window.location.reload();
+                                 }
+                             }}
+                             className="w-full mt-3 py-3.5 rounded-2xl bg-surfaceLight text-red-400 font-bold border border-dark-border active:scale-[0.98] transition-transform hover:bg-red-500/5 hover:border-red-500/30 flex items-center justify-center gap-2 text-xs uppercase"
+                         >
+                             Purge Local Database
+                         </button>
                     </div>
 
-                    <div className="text-center text-muted text-xs py-6 opacity-50 animate-fade-in" style={{ animationDelay: '400ms' }}>
+                    {/* About Card */}
+                    <div className="bg-dark-card border border-dark-border rounded-3xl p-6 animate-scale-in space-y-3" style={{ animationDelay: '220ms', animationFillMode: 'backwards' }}>
+                         <h3 className="text-primary font-bold">About Happy4U</h3>
+                         <p className="text-xs text-muted leading-relaxed">
+                             Happy4U is a fully decentralized, privacy-focused birthday reminders ledger. Reminders are synchronized safely without sending any calendar metadata or personal details outside of your local system context.
+                         </p>
+                    </div>
+
+                    {/* Privacy Policy Card */}
+                    <div className="bg-dark-card border border-dark-border rounded-3xl p-6 animate-scale-in" style={{ animationDelay: '240ms', animationFillMode: 'backwards' }}>
+                         <h3 className="text-primary font-bold mb-2">Privacy</h3>
+                         <p className="text-[11px] text-muted leading-relaxed">
+                             Your privacy is absolute. We do not maintain remote cloud backends, track application events, or analyze notification rosters. Your friendships and associations remain entirely your own business.
+                         </p>
+                    </div>
+
+                    {/* Hidden Developer Mode UI */}
+                    {devModeActive && (
+                        <div className="space-y-6 pt-4 border-t border-dashed border-lime/30 animate-fade-in">
+                            <div className="flex items-center justify-between">
+                                <span className="text-lime font-black uppercase tracking-widest text-[11px] flex items-center gap-1.5">
+                                    <Zap size={14} />
+                                    Developer Engineering Deck Active
+                                </span>
+                                <button 
+                                    onClick={() => {
+                                        setDevModeActive(false);
+                                        localStorage.setItem('happy4u_dev_mode', 'false');
+                                        alert('Developer Mode Deactivated.');
+                                    }}
+                                    className="text-[10px] text-red-100 font-bold border border-red-400/30 px-2 py-1 rounded bg-red-400/5 hover:bg-red-400/10 cursor-pointer"
+                                >
+                                    Hide Deck
+                                </button>
+                            </div>
+
+                            {/* PWA Diagnostics Engine Card */}
+                            {diagnosticsData && (
+                                <div className="bg-dark-card border-2 border-lime/30 rounded-3xl p-6 space-y-4">
+                                    <div className="flex items-center gap-2 mb-1">
+                                        <ShieldCheck size={18} className="text-lime" />
+                                        <h3 className="text-primary font-bold">PWA Infrastructure Diagnostics</h3>
+                                    </div>
+                                    <p className="text-xs text-muted leading-relaxed">
+                                        Dynamic capability telemetry for standards-compliant Progressive Web Apps.
+                                    </p>
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3 bg-surfaceLight border border-dark-border rounded-2xl p-4 font-mono text-[11px] leading-relaxed">
+                                        <div className="flex justify-between border-b border-dark-border/40 pb-1.5 md:border-r md:border-b-0 md:pb-0 md:pr-4">
+                                            <span className="text-muted">Storage Backend:</span>
+                                            <span className="text-lime font-bold">{diagnosticsData.indexedDb === 'supported' ? 'IndexedDB Store' : 'LocalStorage Fallback'}</span>
+                                        </div>
+                                        <div className="flex justify-between border-b border-dark-border/40 pb-1.5 md:border-b-0 md:pb-0 md:pl-4">
+                                            <span className="text-muted">IndexedDB Status:</span>
+                                            <span className="text-lime font-bold">{diagnosticsData.indexedDbStatus === 'working' ? 'Healthy & Online' : 'Failed'}</span>
+                                        </div>
+                                        <div className="flex justify-between border-b border-dark-border/40 pb-1.5 md:border-r md:border-b-0 md:pb-0 md:pr-4">
+                                            <span className="text-muted">Service Worker:</span>
+                                            <span className="text-lime font-bold capitalize">{diagnosticsData.serviceWorkerStatus}</span>
+                                        </div>
+                                        <div className="flex justify-between border-b border-dark-border/40 pb-1.5 md:border-b-0 md:pb-0 md:pl-4">
+                                            <span className="text-muted">Client Cache:</span>
+                                            <span className="text-lime font-bold">{diagnosticsData.cacheVersion || 'happy4u-cache-v2'}</span>
+                                        </div>
+                                        <div className="flex justify-between border-b border-dark-border/40 pb-1.5 md:border-r md:border-b-0 md:pb-0 md:pr-4">
+                                            <span className="text-muted">Notification API:</span>
+                                            <span className="text-lime font-bold uppercase">{diagnosticsData.notificationApi} ({diagnosticsData.notificationPermission})</span>
+                                        </div>
+                                        <div className="flex justify-between border-b border-dark-border/40 pb-1.5 md:border-b-0 md:pb-0 md:pl-4">
+                                            <span className="text-muted">Manifest registration:</span>
+                                            <span className="text-lime font-bold">Attached /manifest.json</span>
+                                        </div>
+                                        <div className="flex justify-between md:col-span-2 pt-1.5 border-t border-dark-border/40 font-bold">
+                                            <span className="text-muted">Installability Status:</span>
+                                            <span className="text-lime font-bold">
+                                                {diagnosticsData.displayMode === 'standalone' 
+                                                    ? 'Installed (Standalone PWA)' 
+                                                    : (diagnosticsData.beforeInstallPrompt === 'supported' 
+                                                        ? 'Installable (Prompt Active)' 
+                                                        : 'Browser (Compatible to install)')
+                                                }
+                                            </span>
+                                        </div>
+                                    </div>
+                                    <button 
+                                        type="button"
+                                        onClick={() => {
+                                            getDiagnostics().then(setDiagnosticsData).catch(console.error);
+                                        }}
+                                        className="w-full py-2 bg-surfaceLight hover:bg-surfaceLight/80 border border-dark-border rounded-xl text-center text-primary text-[11px] font-bold cursor-pointer"
+                                    >
+                                        Inspect Telemetry Now
+                                    </button>
+                                </div>
+                            )}
+
+                            {/* Scheduler Engine Configuration Card */}
+                            <div className="bg-dark-card border-2 border-lime/20 rounded-3xl p-6 space-y-4">
+                                <div className="flex items-center gap-2 mb-2">
+                                    <Zap size={18} className="text-lime" />
+                                    <h3 className="text-primary font-bold">Rolling Scheduler Engine Constants</h3>
+                                </div>
+                                <p className="text-xs text-muted leading-relaxed">
+                                    Configure how many days ahead to pre-schedule reminders and the maximum active local alarms. The engine will automatically cycle and roll forward chronologically.
+                                </p>
+
+                                <div className="space-y-4 pt-2">
+                                    <div className="flex justify-between items-center bg-surfaceLight border border-dark-border rounded-2xl p-4">
+                                        <div className="space-y-1">
+                                            <span className="text-xs text-primary font-bold block">Scheduling Window</span>
+                                            <span className="text-[10px] text-muted block">Days to cover future reminders</span>
+                                        </div>
+                                        <div className="flex items-center gap-4">
+                                            <input 
+                                                type="number" 
+                                                min="1" 
+                                                max="1000"
+                                                value={schedulingWindowDays}
+                                                onChange={(e) => {
+                                                    const val = Math.max(1, parseInt(e.target.value, 10) || 1);
+                                                    setSchedulingWindowDays(val);
+                                                    NotificationNativeScheduler.setSchedulingWindowDays(val);
+                                                    NotificationReconciliationService.reconcile().then(() => {
+                                                        setReconcileStats(NotificationReconciliationService.getLatestStats());
+                                                    });
+                                                }}
+                                                className="bg-dark-card border border-dark-border rounded-xl px-3 py-1.5 w-24 text-primary text-sm font-bold focus:outline-none focus:border-lime transition-colors text-center"
+                                            />
+                                            <span className="text-xs text-muted font-bold">days</span>
+                                        </div>
+                                    </div>
+
+                                    <div className="flex justify-between items-center bg-surfaceLight border border-dark-border rounded-2xl p-4">
+                                        <div className="space-y-1">
+                                            <span className="text-xs text-primary font-bold block">Native Capacity Limit</span>
+                                            <span className="text-[10px] text-muted block">Max physical OS alarm slots</span>
+                                        </div>
+                                        <div className="flex items-center gap-4">
+                                            <input 
+                                                type="number" 
+                                                min="10" 
+                                                max="1000"
+                                                value={nativeLimit}
+                                                onChange={(e) => {
+                                                    const val = Math.max(10, parseInt(e.target.value, 10) || 10);
+                                                    setNativeLimit(val);
+                                                    NotificationNativeScheduler.setNativeLimit(val);
+                                                    NotificationReconciliationService.reconcile().then(() => {
+                                                        setReconcileStats(NotificationReconciliationService.getLatestStats());
+                                                    });
+                                                }}
+                                                className="bg-dark-card border border-dark-border rounded-xl px-3 py-1.5 w-24 text-primary text-sm font-bold focus:outline-none focus:border-lime transition-colors text-center"
+                                            />
+                                            <span className="text-xs text-muted font-bold">slots</span>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            {/* Real-time Verification Console Card */}
+                            <div className="bg-dark-card border-2 border-lime/20 rounded-3xl p-6 space-y-4">
+                                <div className="flex items-center gap-2 mb-1">
+                                    <Terminal size={18} className="text-lime" />
+                                    <h3 className="text-primary font-bold">Verification & Telemetry (Internal Diagnostics)</h3>
+                                </div>
+                                <p className="text-xs text-muted leading-relaxed">
+                                    Proof of active local reminders, dynamic bounds, and validation telemetry.
+                                </p>
+
+                                {reconcileStats ? (
+                                    <div className="space-y-2 bg-surfaceLight border border-dark-border rounded-2xl p-4 font-mono text-[11px] leading-relaxed relative overflow-hidden">
+                                        <div className="absolute right-3 top-3 px-1.5 py-0.5 rounded bg-lime/10 border border-lime/20 text-[9px] text-lime font-bold font-sans">
+                                            IDEMPOTENT
+                                        </div>
+                                        <div className="flex justify-between border-b border-dark-border/40 pb-1.5">
+                                            <span className="text-muted text-[11px]">Birthdays Loaded:</span>
+                                            <span className="text-primary font-bold">{reconcileStats.birthdaysLoaded}</span>
+                                        </div>
+                                        <div className="flex justify-between border-b border-dark-border/40 pb-1.5 font-mono">
+                                            <span className="text-muted text-[11px]">Calculated Reminders:</span>
+                                            <span className="text-primary font-bold">{reconcileStats.totalCalculated}</span>
+                                        </div>
+                                        <div className="flex justify-between border-b border-dark-border/40 pb-1.5 font-mono">
+                                            <span className="text-muted text-[11px]">Scheduling Window:</span>
+                                            <span className="text-primary font-bold">next {reconcileStats.schedulingWindowDays} days</span>
+                                        </div>
+                                        <div className="flex justify-between border-b border-dark-border/40 pb-1.5 font-mono">
+                                            <span className="text-muted text-[11px]">OS Capacity Limit:</span>
+                                            <span className="text-primary font-bold">{reconcileStats.nativeLimit}</span>
+                                        </div>
+                                        <div className="flex justify-between border-b border-dark-border/40 pb-1.5 font-mono">
+                                            <span className="text-muted text-[11px]">Actually Scheduled:</span>
+                                            <span className="text-lime font-bold">{reconcileStats.nativeRegistered}</span>
+                                        </div>
+                                        <div className="flex justify-between border-b border-dark-border/40 pb-1.5 font-mono">
+                                            <span className="text-muted text-[11px]">Already Scheduled:</span>
+                                            <span className="text-primary">{reconcileStats.alreadyScheduled}</span>
+                                        </div>
+                                        <div className="flex justify-between border-b border-dark-border/40 pb-1.5 font-mono">
+                                            <span className="text-muted text-[11px]">Missing Scheduled:</span>
+                                            <span className="text-primary">{reconcileStats.missingScheduled}</span>
+                                        </div>
+                                        <div className="flex justify-between border-b border-dark-border/40 pb-1.5 font-mono">
+                                            <span className="text-muted text-[11px]">Duplicate Count:</span>
+                                            <span className="text-primary">{reconcileStats.duplicateCount}</span>
+                                        </div>
+                                        <div className="flex justify-between border-b border-dark-border/40 pb-1.5 font-mono">
+                                            <span className="text-muted text-[11px]">Orphan Count:</span>
+                                            <span className="text-primary">{reconcileStats.orphanCount}</span>
+                                        </div>
+                                        <div className="flex justify-between border-b border-dark-border/40 pb-1.5 font-mono">
+                                            <span className="text-muted text-[11px]">Collision Count:</span>
+                                            <span className="text-primary">{reconcileStats.collisionCount}</span>
+                                        </div>
+                                        <div className="flex flex-col border-b border-dark-border/40 pb-1.5 font-mono">
+                                            <span className="text-muted block text-[11px]">Next Scheduled Alert:</span>
+                                            <span className="text-[10px] text-primary truncate mt-0.5 font-mono">{reconcileStats.nextScheduledReminder || 'None'}</span>
+                                        </div>
+                                        <div className="flex flex-col pb-0.5 font-mono">
+                                            <span className="text-muted block text-[11px]">Last Scheduled Alert:</span>
+                                            <span className="text-[10px] text-primary truncate mt-0.5 font-mono">{reconcileStats.lastScheduledReminder || 'None'}</span>
+                                        </div>
+                                    </div>
+                                ) : (
+                                    <div className="bg-surfaceLight border border-dark-border rounded-2xl p-4 text-center font-mono text-[11px] text-muted-foreground leading-relaxed">
+                                        No telemetry events recorded. Perform/trigger reconciliation.
+                                    </div>
+                                )}
+                                <button 
+                                    onClick={() => {
+                                        NotificationReconciliationService.reconcile().then(() => {
+                                            setReconcileStats(NotificationReconciliationService.getLatestStats());
+                                        });
+                                    }}
+                                    className="w-full py-3 rounded-2xl bg-lime text-black font-extrabold text-xs active:scale-[0.98] transition-all hover:bg-lime/90 flex items-center justify-center gap-1.5 shadow shadow-lime/20 cursor-pointer uppercase tracking-wider"
+                                >
+                                    <Sparkles size={14} strokeWidth={2.5} />
+                                    Recalculate & Reconcile Now
+                                </button>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* App Version Footer (Tapped 7 times to reveal developer controls) */}
+                    <div 
+                        onClick={handleVersionClick}
+                        className="text-center text-muted text-xs py-6 opacity-50 hover:opacity-100 transition-opacity select-none cursor-pointer duration-300"
+                    >
                         Happy4U v1.3.0
                     </div>
                 </div>
@@ -796,6 +1414,35 @@ export default function App() {
                     setIsWelcomeOpen(true);
                 }
             }}
+        />
+
+        <NotificationInboxModal
+            isOpen={isInboxOpen}
+            onClose={() => setIsInboxOpen(false)}
+            notifications={inAppNotifs}
+            onMarkRead={(id) => {
+                setInAppNotifs(prev => prev.map(n => n.id === id ? { ...n, read: true } : n));
+            }}
+            onMarkAllRead={() => {
+                setInAppNotifs(prev => prev.map(n => ({ ...n, read: true })));
+            }}
+            onDelete={(id) => {
+                setInAppNotifs(prev => prev.filter(n => n.id !== id));
+            }}
+            onClearAll={() => {
+                if (confirm('Clear notification history?')) {
+                    setInAppNotifs([]);
+                }
+            }}
+            onOpenBirthday={(birthdayId) => {
+                setIsInboxOpen(false);
+                setView('home');
+                const match = birthdays.find(b => b.id === birthdayId);
+                if (match) {
+                    setPopupBirthdays([match]);
+                }
+            }}
+            birthdaysList={birthdays}
         />
 
         {popupBirthdays.length > 0 && (
